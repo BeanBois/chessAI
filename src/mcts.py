@@ -27,10 +27,6 @@ class MCTSNode:
 
     @property
     def env(self):
-        """
-        Lazy clone — board is only copied when this node is actually
-        selected during tree traversal, not when it's created as a child.
-        """
         if self._env is None:
             assert self.parent is not None and self.move is not None
             self._env = self.parent.env.clone()
@@ -79,7 +75,7 @@ class MCTS:
         neural_net,
         c_puct: float            = 1.4,
         num_simulations: int     = 800,
-        batch_size: int          = 32,   # was 16 — larger batch = fewer NN calls
+        batch_size: int          = 32,
         dirichlet_alpha: float   = 0.3,
         dirichlet_epsilon: float = 0.25,
         temperature: float       = 1.0,
@@ -91,78 +87,146 @@ class MCTS:
         self.dirichlet_alpha     = dirichlet_alpha
         self.dirichlet_epsilon   = dirichlet_epsilon
         self.temperature         = temperature
-
-        # Tree reuse: persists between get_action_probs() calls within a game.
-        # advance_root() sets this after each move is committed.
         self._next_root: Optional[MCTSNode] = None
 
+        # State for externally-driven parallel search (ParallelSelfPlay)
+        self._search_root:   Optional[MCTSNode] = None
+        self._search_sims:   int  = 0
+        self._root_expanded: bool = False
+
     # ------------------------------------------------------------------
-    # Tree reuse
+    # Parallel search API  (used by ParallelSelfPlay)
     # ------------------------------------------------------------------
 
-    def advance_root(self, move: chess.Move):
+    def prepare_search(self, env) -> None:
         """
-        Call this immediately AFTER a move is chosen but BEFORE env.step().
-        Saves the child corresponding to `move` so the next search reuses
-        all visits already recorded in that subtree.
+        Initialise a root node ready for the next position.
+        Must be called once per move before any select_leaves() calls.
+        Handles tree reuse via _next_root automatically.
 
-        Why this works: the child node already contains visit_count,
-        value_sum, and expanded grandchildren from this move's search.
-        The next search starts with those counts rather than zero,
-        effectively getting them "for free".
+        Does NOT call the neural network — root expansion is deferred to
+        the first select_leaves() call so it can be batched with other games.
         """
-        if self._next_root is not None and move in self._next_root.children:
-            # We already have a deeper saved root — walk one level further.
-            candidate = self._next_root.children[move]
-        elif hasattr(self, '_current_root') and move in self._current_root.children:
-            candidate = self._current_root.children[move]
-        else:
-            # Move not in tree (shouldn't happen in normal play).
-            self._next_root = None
-            return
-
-        # Materialise the env NOW while the parent is still alive
-        # (lazy eval needs the parent chain; once parent=None it can't clone).
-        _ = candidate.env          # triggers lazy clone + step if needed
-        candidate.parent = None    # detach — allows GC of the rest of the tree
-        self._next_root = candidate
-
-    def get_action_probs(self, env) -> dict[chess.Move, float]:
-        # ── Reuse or build root ──────────────────────────────────────────
         if self._next_root is not None and self._next_root.is_expanded:
+            # Reuse the subtree we saved from the previous move
             root = self._next_root
             self._next_root = None
-            # Re-parent children so PUCT parent counts are correct
             for child in root.children.values():
                 child.parent = root
+            self._root_expanded = True   # already has priors from last search
         else:
             self._next_root = None
             root = MCTSNode(env=env.clone())
-            self._expand_batch([root])
+            self._root_expanded = False  # needs NN eval before we can search
 
-        # Always inject fresh Dirichlet noise at the root for exploration.
-        # For reused roots the visits dominate the prior anyway for
-        # well-explored children, so this only matters for rarely-visited ones.
+        self._search_root  = root
+        self._current_root = root
+        self._search_sims  = 0
+
+    def select_leaves(self, n: int) -> tuple[list, list]:
+        """
+        Selection phase only — NO neural network call happens here.
+
+        If the root is brand new (not yet expanded), the root itself is
+        returned as the single leaf so the caller can evaluate it in a
+        pooled batch alongside other games' leaves.
+
+        Terminal nodes are resolved in-place (no NN needed) and counted
+        against the simulation budget.
+
+        Returns (leaves, paths) for the caller to pass to process_results()
+        after a batched NN forward pass.
+        """
+        root = self._search_root
+
+        # Fresh root — must be expanded before we can run PUCT
+        if not self._root_expanded:
+            return [root], [[root]]
+
+        leaves: list = []
+        paths:  list = []
+
+        for _ in range(n):
+            if self._search_sims + len(leaves) >= self.num_simulations:
+                break
+            node, path = self._select(root)
+            if node is None:
+                break
+            # Terminals don't need NN — backprop game result immediately
+            if node.is_terminal:
+                value = node.env.get_result(node.env.current_player)
+                self._backpropagate(path, value)
+                self._search_sims += 1
+                continue
+            node.apply_virtual_loss(path)
+            leaves.append(node)
+            paths.append(path)
+
+        return leaves, paths
+
+    def process_results(
+        self,
+        leaves:           list,
+        paths:            list,
+        policy_logits_np: np.ndarray,  # shape (len(leaves), 4672)
+        values_np:        np.ndarray,  # shape (len(leaves),)
+    ) -> None:
+        """
+        Expand leaves and backpropagate after an external batched NN call.
+
+        The caller (ParallelSelfPlay) pools leaves from N games into one
+        big batch, runs a single GPU forward pass, then calls this for each
+        game with its slice of the results.
+
+        Dirichlet noise is injected the first time the root is expanded.
+        """
+        for i, node in enumerate(leaves):
+            node._nn_value = float(values_np[i])
+            policy_dict    = policy_to_move_probs(policy_logits_np[i], node.env.board)
+            for move in node.env.get_legal_moves():
+                node.children[move] = MCTSNode(
+                    env    = None,
+                    parent = node,
+                    move   = move,
+                    prior  = policy_dict.get(move, 1e-8),
+                )
+            node.is_expanded = True
+
+            # Root expanded for first time — add exploration noise now
+            if node is self._search_root:
+                self._add_dirichlet_noise(node)
+                self._root_expanded = True
+
+        for node, path in zip(leaves, paths):
+            node.revert_virtual_loss(path)
+            self._backpropagate(path, node._nn_value)
+
+        self._search_sims += len(leaves)
+
+    def search_done(self) -> bool:
+        """True once the root is expanded and the simulation budget is spent."""
+        return self._root_expanded and self._search_sims >= self.num_simulations
+
+    # ------------------------------------------------------------------
+    # Original single-game API  (Evaluator and SelfPlay.play_game use this)
+    # ------------------------------------------------------------------
+
+    def get_action_probs(self, env) -> dict[chess.Move, float]:
+        root = MCTSNode(env=env.clone())
+        self._expand_batch([root])
         self._add_dirichlet_noise(root)
 
-        # Save so advance_root() can walk into the chosen child
-        self._current_root = root
-
-        # ── Simulation loop ──────────────────────────────────────────────
         sims_done = 0
         while sims_done < self.num_simulations:
-            batch_paths  = []
-            batch_leaves = []
+            batch_paths:  list = []
+            batch_leaves: list = []
 
             for _ in range(self.batch_size):
                 if sims_done + len(batch_leaves) >= self.num_simulations:
                     break
-
                 node, path = self._select(root)
-
                 if node is None:
                     break
-
                 node.apply_virtual_loss(path)
                 batch_paths.append(path)
                 batch_leaves.append(node)
@@ -174,78 +238,73 @@ class MCTS:
 
             for node, path in zip(batch_leaves, batch_paths):
                 node.revert_virtual_loss(path)
-                if node.is_terminal:
-                    value = node.env.get_result(node.env.current_player)
-                else:
-                    value = node._nn_value
+                value = (
+                    node.env.get_result(node.env.current_player)
+                    if node.is_terminal else node._nn_value
+                )
                 self._backpropagate(path, value)
 
             sims_done += len(batch_leaves)
 
+        self._current_root = root
         return self._action_probabilities(root)
 
     # ------------------------------------------------------------------
-    # Selection
+    # Tree reuse (shared by both APIs)
+    # ------------------------------------------------------------------
+
+    def advance_root(self, move: chess.Move):
+        """
+        Save the chosen move's child subtree for the next search.
+        Call BEFORE env.step() so the parent env is still alive for
+        lazy board cloning.
+        """
+        source = getattr(self, '_current_root', None) or self._search_root
+        if source is None or move not in source.children:
+            self._next_root = None
+            return
+        candidate = source.children[move]
+        _ = candidate.env        # materialise lazy clone while parent alive
+        candidate.parent = None  # detach — lets the rest of the tree be GC'd
+        self._next_root = candidate
+
+    # ------------------------------------------------------------------
+    # Internal helpers
     # ------------------------------------------------------------------
 
     def _select(self, root: MCTSNode) -> tuple[Optional[MCTSNode], list]:
         node = root
         path = [node]
-
         while not node.is_leaf and not node.is_terminal:
             node = node.best_child(self.c_puct)
             path.append(node)
-
-        if node.is_terminal:
-            return node, path
-
         return node, path
 
-    # ------------------------------------------------------------------
-    # Batched expansion
-    # ------------------------------------------------------------------
-
-    def _expand_batch(self, leaves: list[MCTSNode]):
+    def _expand_batch(self, leaves: list):
         to_evaluate = [n for n in leaves if not n.is_terminal and not n.is_expanded]
         if not to_evaluate:
             return
-
         boards = [n.env.board for n in to_evaluate]
         batch  = self.neural_net.encode_batch(boards)
-
         with torch.no_grad():
             policy_logits, values = self.neural_net.model(batch)
-
         policy_logits_np = policy_logits.cpu().numpy()
         values_np        = values.squeeze(1).cpu().numpy()
-
         for i, node in enumerate(to_evaluate):
             node._nn_value = float(values_np[i])
             policy_dict    = policy_to_move_probs(policy_logits_np[i], node.env.board)
-
             for move in node.env.get_legal_moves():
                 node.children[move] = MCTSNode(
-                    env    = None,
-                    parent = node,
-                    move   = move,
-                    prior  = policy_dict.get(move, 1e-8),
+                    env=None, parent=node, move=move,
+                    prior=policy_dict.get(move, 1e-8),
                 )
-
             node.is_expanded = True
 
-    # ------------------------------------------------------------------
-    # Backpropagation
-    # ------------------------------------------------------------------
-
-    def _backpropagate(self, path: list[MCTSNode], value: float):
+    def _backpropagate(self, path: list, value: float):
         for node in reversed(path):
             node.visit_count += 1
             node.value_sum   += value
             value = -value
-
-    # ------------------------------------------------------------------
-    # Dirichlet noise
-    # ------------------------------------------------------------------
 
     def _add_dirichlet_noise(self, root: MCTSNode):
         if not root.children:
@@ -259,23 +318,17 @@ class MCTS:
                 + self.dirichlet_epsilon * n
             )
 
-    # ------------------------------------------------------------------
-    # Action selection
-    # ------------------------------------------------------------------
-
     def _action_probabilities(self, root: MCTSNode) -> dict[chess.Move, float]:
         moves        = list(root.children.keys())
         visit_counts = np.array(
             [root.children[m].visit_count for m in moves], dtype=np.float32
         )
-
         if self.temperature == 0:
             probs = np.zeros_like(visit_counts)
             probs[np.argmax(visit_counts)] = 1.0
         else:
             counts_temp = visit_counts ** (1.0 / self.temperature)
-            probs = counts_temp / counts_temp.sum()
-
+            probs       = counts_temp / counts_temp.sum()
         return dict(zip(moves, probs))
 
     def select_move(self, env) -> chess.Move:
