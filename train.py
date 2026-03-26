@@ -108,7 +108,7 @@ def main():
 
             # 1. Self-play
             print(f"\n[1] Self-play ({GAMES_PER_ITER} games)...")
-            self_play = ParallelSelfPlay(neural_net=best_net, num_simulations=SIMULATIONS, num_parallel=20)
+            self_play = ParallelSelfPlay(neural_net=best_net, num_simulations=SIMULATIONS, num_parallel=40, leaves_per_game=10)
             positions = self_play.generate(num_games=GAMES_PER_ITER)
 
             buffer.push_game(positions)

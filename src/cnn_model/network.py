@@ -157,9 +157,10 @@ class NeuralNetwork:
         return t.to(self.device)
 
     def encode_batch(self, boards: list[chess.Board]) -> torch.Tensor:
-        """Stack multiple boards into one tensor — (B, 18, 8, 8)."""
         planes = np.stack([encode_board(b) for b in boards]).astype(np.float32)
-        return torch.from_numpy(planes).to(self.device)
+        t = torch.from_numpy(planes).to(self.device, non_blocking=True)
+        return t   # autocast handles the fp16 cast during forward
+
 
     def evaluate_batch(
         self,

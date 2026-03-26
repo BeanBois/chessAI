@@ -191,6 +191,8 @@ class ParallelSelfPlay:
         self.num_simulations = num_simulations
         self.num_parallel    = num_parallel
         self.leaves_per_game = leaves_per_game
+        self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
 
     def generate(self, num_games: int) -> list[tuple]:
         all_positions: list = []
@@ -225,22 +227,22 @@ class ParallelSelfPlay:
             # ── 2. Single GPU forward pass for ALL leaves ─────────────────
             if all_leaves:
                 boards = [node.env.board for node in all_leaves]
-                batch  = self.neural_net.encode_batch(boards)  # (N, 18, 8, 8)
+                # non_blocking=True lets CPU keep working while transfer happens
+                batch = self.neural_net.encode_batch(boards)  
 
-                with torch.no_grad():
-                    policy_logits, values = self.neural_net.model(batch)
+                if self._stream:
+                    with torch.cuda.stream(self._stream):
+                        with torch.no_grad():
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                policy_logits, values = self.neural_net.model(batch)
+                    # CPU can do other work here until we actually need the results
+                    self._stream.synchronize()
+                else:
+                    with torch.no_grad():
+                        policy_logits, values = self.neural_net.model(batch)
 
-                pol_np = policy_logits.cpu().numpy()  # (N, 4672)
-                val_np = values.squeeze(1).cpu().numpy()  # (N,)
-
-                # ── 3. Distribute results back to each slot ───────────────
-                for slot, start, end in slot_slices:
-                    slot.mcts.process_results(
-                        all_leaves[start:end],
-                        all_paths[start:end],
-                        pol_np[start:end],
-                        val_np[start:end],
-                    )
+                pol_np = policy_logits.float().cpu().numpy()
+                val_np = values.float().squeeze(1).cpu().numpy()
 
             # ── 4. Commit moves for slots that have finished searching ─────
             for slot in active:
