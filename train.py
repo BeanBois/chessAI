@@ -5,7 +5,7 @@ import sys
 import torch
 from src.cnn_model.network import ChessNet, NeuralNetwork
 from src.replay_buffer import ReplayBuffer
-from src.parallel_self_play import ParallelSelfPlay
+from src.self_play import SelfPlay
 from src.trainer import Trainer
 from src.evaluator import Evaluator
 from src.logger import MetricsLogger
@@ -108,8 +108,8 @@ def main():
 
             # 1. Self-play
             print(f"\n[1] Self-play ({GAMES_PER_ITER} games)...")
-            self_play = ParallelSelfPlay(neural_net=best_net, num_simulations=SIMULATIONS, num_parallel=20)
-            positions = self_play.generate(num_games=GAMES_PER_ITER)
+            self_play = SelfPlay(neural_net=best_net, num_simulations=SIMULATIONS)
+            positions = self_play.generate(num_games=GAMES_PER_ITER, num_workers=20)
 
             buffer.push_game(positions)
 
