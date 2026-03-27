@@ -156,40 +156,51 @@ class NeuralNetwork:
         t = torch.from_numpy(planes).unsqueeze(0)          # (1, 18, 8, 8)
         return t.to(self.device)
 
-    def encode_batch(self, boards: list[chess.Board]) -> torch.Tensor:
+    # def encode_batch(self, boards: list[chess.Board]) -> torch.Tensor:
+    #     planes = np.stack([encode_board(b) for b in boards]).astype(np.float32)
+    #     t = torch.from_numpy(planes).to(self.device, non_blocking=True)
+    #     return t   # autocast handles the fp16 cast during forward
+
+
+    # def evaluate_batch(
+    #     self,
+    #     batch: torch.Tensor,
+    # ) -> tuple[list[dict[chess.Move, float]], list[float]]:
+    #     """
+    #     Single forward pass for a batch of boards.
+    #     Returns parallel lists of (policy_dict, value).
+    #     """
+    #     with torch.no_grad():
+    #         policy_logits, values = self.model(batch)   # (B, 4672), (B, 1)
+
+    #     policy_logits_np = policy_logits.cpu().numpy()
+    #     values_np        = values.squeeze(1).cpu().numpy()
+
+    #     # We need the board object to build legal move masks —
+    #     # store them on the node's env so we can retrieve them here
+    #     # (encode_batch receives boards directly for this reason)
+    #     results_policy = []
+    #     results_value  = []
+
+    #     for i in range(len(batch)):
+    #         # Reconstruct a temporary board to get legal moves for masking
+    #         # This is why encode_batch takes boards, not envs
+    #         # In practice you'd pass boards alongside the batch
+    #         results_policy.append(policy_logits_np[i])
+    #         results_value.append(float(values_np[i]))
+
+    #     return results_policy, results_value
+    # network.py — revert to simple GPU-only inference, remove _cpu_model entirely
+    
+    def encode_batch(self, boards: list) -> torch.Tensor:
         planes = np.stack([encode_board(b) for b in boards]).astype(np.float32)
-        t = torch.from_numpy(planes).to(self.device, non_blocking=True)
-        return t   # autocast handles the fp16 cast during forward
+        return torch.from_numpy(planes).to(self.device)   # straight to GPU
 
-
-    def evaluate_batch(
-        self,
-        batch: torch.Tensor,
-    ) -> tuple[list[dict[chess.Move, float]], list[float]]:
-        """
-        Single forward pass for a batch of boards.
-        Returns parallel lists of (policy_dict, value).
-        """
+    def evaluate_batch_infer(self, batch: torch.Tensor):
+        """GPU inference for both self-play and training."""
         with torch.no_grad():
-            policy_logits, values = self.model(batch)   # (B, 4672), (B, 1)
-
-        policy_logits_np = policy_logits.cpu().numpy()
-        values_np        = values.squeeze(1).cpu().numpy()
-
-        # We need the board object to build legal move masks —
-        # store them on the node's env so we can retrieve them here
-        # (encode_batch receives boards directly for this reason)
-        results_policy = []
-        results_value  = []
-
-        for i in range(len(batch)):
-            # Reconstruct a temporary board to get legal moves for masking
-            # This is why encode_batch takes boards, not envs
-            # In practice you'd pass boards alongside the batch
-            results_policy.append(policy_logits_np[i])
-            results_value.append(float(values_np[i]))
-
-        return results_policy, results_value
+            policy_logits, values = self.model(batch)
+        return policy_logits.cpu().numpy(), values.squeeze(1).cpu().numpy()
 
     def save(self, path: str):
         torch.save(self.model.state_dict(), path)
