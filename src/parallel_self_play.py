@@ -203,6 +203,7 @@ class ParallelSelfPlay:
         slots   = [_Slot(self.num_simulations) for _ in range(n_slots)]
         for slot in slots:
             slot.reset()
+        print('Generating games ... ')
 
         while completed < num_games:
             active = [s for s in slots if not s.done]
@@ -219,12 +220,19 @@ class ParallelSelfPlay:
                 if slot.mcts.search_done():
                     continue   # this slot is waiting to commit, skip
                 start = len(all_leaves)
-                lv, pa = slot.mcts.select_leaves(self.leaves_per_game)
+                try:
+                    lv, pa = slot.mcts.select_leaves(self.leaves_per_game)
+                except Exception as e:
+                    print(f"[!] select_leaves failed for slot, skipping: {e}")
+                    slot.done = True
+                    continue
                 all_leaves.extend(lv)
                 all_paths.extend(pa)
                 slot_slices.append((slot, start, len(all_leaves)))
 
             # ── 2. Single GPU forward pass for ALL leaves ─────────────────
+            pol_np = None
+            val_np = None
             if all_leaves:
                 boards = [node.env.board for node in all_leaves]
                 # non_blocking=True lets CPU keep working while transfer happens
@@ -243,12 +251,39 @@ class ParallelSelfPlay:
 
                 pol_np = policy_logits.float().cpu().numpy()
                 val_np = values.float().squeeze(1).cpu().numpy()
-
+            
+            # ── 3. Feed results back to each slot ────────────────────────────
+            for slot, start, end in slot_slices:
+                if start == end or pol_np is None:
+                    continue   # this slot contributed no leaves this step
+                try:
+                    slot.mcts.process_results(
+                        leaves           = all_leaves[start:end],
+                        paths            = all_paths[start:end],
+                        policy_logits_np = pol_np[start:end],
+                        values_np        = val_np[start:end],
+                    )
+                except Exception as e:
+                    print(f"[!] process_results failed for slot, skipping: {e}")
+                    slot.done = True
+    # Safety guard — break only if no slot has even started (true deadlock)
+            if not all_leaves and not any(s.mcts.search_done() for s in active):
+                # A slot may have exhausted its budget entirely via terminal
+                # nodes this round (0 NN leaves, but sims fully counted).
+                # Only bail if no slot has an expanded root yet — that is a
+                # true deadlock where nothing can ever make progress.
+                if not any(s.mcts._root_expanded for s in active):
+                    print("[!] Warning: no leaves collected and no slots ready — breaking.")
+                    break
             # ── 4. Commit moves for slots that have finished searching ─────
             for slot in active:
                 if not slot.mcts.search_done():
                     continue
-                slot.commit_move()
+                try:
+                    slot.commit_move()
+                except Exception as e:
+                    print(f"[!] commit_move failed for slot, skipping: {e}")
+                    slot.done = True
                 if slot.done:
                     all_positions.extend(slot.trajectory)
                     completed += 1

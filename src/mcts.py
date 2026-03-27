@@ -152,10 +152,12 @@ class MCTS:
             node, path = self._select(root)
             if node is None:
                 break
-            # Terminals don't need NN — backprop game result immediately
+            # Terminals don't need NN — backprop game result immediately.
+            # Mark as expanded so _select won't revisit this node.
             if node.is_terminal:
                 value = node.env.get_result(node.env.current_player)
                 self._backpropagate(path, value)
+                node.is_expanded = True  # prevent re-visiting this terminal
                 self._search_sims += 1
                 continue
             node.apply_virtual_loss(path)
@@ -212,6 +214,12 @@ class MCTS:
     # ------------------------------------------------------------------
 
     def get_action_probs(self, env) -> dict[chess.Move, float]:
+        if self.neural_net is None:
+            raise RuntimeError(
+                "get_action_probs() cannot be called when neural_net=None. "
+                "This MCTS instance is in parallel mode — NN calls are driven "
+                "externally by ParallelSelfPlay."
+            )
         root = MCTSNode(env=env.clone())
         self._expand_batch([root])
         self._add_dirichlet_noise(root)
@@ -264,7 +272,12 @@ class MCTS:
             self._next_root = None
             return
         candidate = source.children[move]
-        _ = candidate.env        # materialise lazy clone while parent alive
+        # Materialise the lazy env clone BEFORE detaching the parent.
+        # MCTSNode.env lazily calls parent.env.clone() on first access, so the
+        # entire ancestor chain must still be alive when we access it here.
+        # After this line the candidate's _env is a fully independent object
+        # and parent detachment is safe — the rest of the tree can be GC'd.
+        _ = candidate.env
         candidate.parent = None  # detach — lets the rest of the tree be GC'd
         self._next_root = candidate
 

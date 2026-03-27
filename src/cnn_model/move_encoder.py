@@ -6,9 +6,12 @@ from functools import lru_cache
 #
 # Per source square, 73 planes:
 #   0–55  : queen-like moves  (8 directions × 7 distances)
+#             NOTE: queen promotions share the same index as the corresponding
+#             rank-6→7 queen-like move (both chess.Move(f,t) and
+#             chess.Move(f,t,chess.QUEEN) map to the same plane).
 #   56–63 : knight moves      (8 offsets)
 #   64–72 : underpromotions   (3 piece types × 3 directions)
-#             pieces: knight=0, bishop=1, rook=2
+#             pieces: knight=0, bishop=1, rook=2  (queen is NOT here)
 #             dirs:   left diagonal=0, straight=1, right diagonal=2
 
 NUM_PLANES    = 73
@@ -60,7 +63,10 @@ def _build_move_to_index() -> dict:
                 idx = from_sq * NUM_PLANES + plane
                 move = chess.Move(from_sq, to_sq)
                 move_to_idx[move] = idx
-                # Queen promotion (default — no explicit promo piece needed)
+                # Queen promotion shares this plane — both Move(f,t) and
+                # Move(f,t, QUEEN) map to the same index so the network
+                # naturally learns to prefer queen promotions via the
+                # queen-plane rather than needing a dedicated slot.
                 if from_rank == 6 and to_rank == 7:
                     move_to_idx[chess.Move(from_sq, to_sq, chess.QUEEN)] = idx
 
@@ -75,7 +81,7 @@ def _build_move_to_index() -> dict:
             idx = from_sq * NUM_PLANES + plane
             move_to_idx[chess.Move(from_sq, to_sq)] = idx
 
-        # Underpromotions (only from rank 6 → rank 7 for white)
+        # Underpromotions (knight/bishop/rook only — queen uses the queen-plane above)
         if from_rank == 6:
             for promo_idx, promo_piece in enumerate(UNDER_PROMO_PIECES):
                 for dir_offset_idx, df in enumerate(UNDER_PROMO_DIRS):

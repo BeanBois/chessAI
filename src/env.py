@@ -128,12 +128,10 @@ class ChessGame:
 
     def _mobility_reward(self) -> float:
         opponent_mobility = self.board.legal_moves.count()
-        if self.board.is_valid() and not self.board.is_check():
-            self.board.push(chess.Move.null())
-            our_mobility = self.board.legal_moves.count()
-            self.board.pop()
-        else:
-            our_mobility = 0
+        # Toggle turn to count our legal moves without pushing an illegal null move
+        self.board.turn = not self.board.turn
+        our_mobility = self.board.legal_moves.count()
+        self.board.turn = not self.board.turn
         diff = our_mobility - opponent_mobility
         return MOBILITY_WEIGHT * np.clip(diff / 218.0, -1.0, 1.0)
 

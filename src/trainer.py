@@ -49,9 +49,12 @@ class Trainer:
         """
         Sample a batch from the buffer and do one round of gradient updates.
         Returns a dict of losses for logging.
+        Caller must ensure len(buffer) >= batch_size before calling.
         """
-        if len(buffer) < self.batch_size:
-            return {}   # not enough data yet
+        assert len(buffer) >= self.batch_size, (
+            f"Buffer too small: {len(buffer)} < {self.batch_size}. "
+            "Check MIN_BUFFER_SIZE guard in train.py."
+        )
 
         states, policies, values = buffer.sample(
             min(len(buffer), self.batch_size * self.epochs_per_update)
