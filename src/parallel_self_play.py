@@ -259,5 +259,5 @@ class ParallelSelfPlay:
                     # Recycle the slot for the next game if needed
                     if completed < num_games:
                         slot.reset()
-
+        print(f'{num_games} completed')
         return all_positions
