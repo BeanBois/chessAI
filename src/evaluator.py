@@ -102,7 +102,7 @@ class Evaluator:
             env.step(move)
 
         outcome = env.board.outcome()
-        if outcome is None:
+        if outcome is None or outcome.winner is None:
             return "draw"
         winner_is_white = outcome.winner == chess.WHITE
         candidate_won   = winner_is_white == candidate_is_white

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import chess
 
-from .board_encoder import encode_board
+from .board_encoder import encode_board, TOTAL_PLANES
 from .move_encoder import policy_to_move_probs, TOTAL_ACTIONS
 
 
@@ -54,9 +54,9 @@ class ChessNet(nn.Module):
 
     def __init__(
         self,
-        in_planes:    int = 18,    # board encoding depth
+        in_planes:    int = TOTAL_PLANES,  # 144 (8 history × 18 planes)
         num_channels: int = 256,   # residual tower width
-        num_blocks:   int = 10,    # residual tower depth
+        num_blocks:   int = 20,    # residual tower depth
         policy_size:  int = TOTAL_ACTIONS,  # 4672
     ):
         super().__init__()
@@ -71,10 +71,10 @@ class ChessNet(nn.Module):
         self.policy_conv = ConvBnRelu(num_channels, 2, kernel=1, padding=0)
         self.policy_fc   = nn.Linear(2 * 8 * 8, policy_size)
 
-        # Value head: 1×1 conv → flatten → FC → tanh
+        # Value head: 1×1 conv → flatten → FC → 3-class categorical (loss/draw/win)
         self.value_conv = ConvBnRelu(num_channels, 1, kernel=1, padding=0)
         self.value_fc1  = nn.Linear(1 * 8 * 8, 256)
-        self.value_fc2  = nn.Linear(256, 1)
+        self.value_fc2  = nn.Linear(256, 3)  # logits for [loss, draw, win]
 
         self._init_weights()
 
@@ -90,7 +90,7 @@ class ChessNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor):
-        # x: (B, 18, 8, 8)
+        # x: (B, 144, 8, 8)
         out = self.stem(x)    # (B, 256, 8, 8)
         out = self.tower(out) # (B, 256, 8, 8)
 
@@ -99,12 +99,13 @@ class ChessNet(nn.Module):
         p = p.view(p.size(0), -1)                   # (B, 128)
         policy_logits = self.policy_fc(p)            # (B, 4672)
 
-        # Value head
+        # Value head: categorical over {loss, draw, win}
+        # Returns (B, 3) logits. Caller converts to scalar via softmax.
         v = self.value_conv(out)                    # (B, 1, 8, 8)
         v = F.relu(self.value_fc1(v.view(v.size(0), -1)), inplace=True)
-        value = torch.tanh(self.value_fc2(v))       # (B, 1) ∈ [-1, 1]
+        value_logits = self.value_fc2(v)            # (B, 3) ∈ [-∞, +∞]
 
-        return policy_logits, value
+        return policy_logits, value_logits
 
 
 # ------------------------------------------------------------------
@@ -119,7 +120,7 @@ class NeuralNetwork:
 
     def __init__(self, model: ChessNet = None, device: str = "cpu"):
         self.device = torch.device(device)
-        self.model  = (model or ChessNet()).to(self.device)
+        self.model  = (model if model is not None else ChessNet()).to(self.device)
         self.model.eval()
 
     def evaluate(
@@ -135,10 +136,13 @@ class NeuralNetwork:
         board_tensor = self._encode(env.board)
 
         with torch.no_grad():
-            policy_logits, value = self.model(board_tensor)
+            policy_logits, value_logits = self.model(board_tensor)
 
         policy_np = policy_logits.squeeze(0).cpu().numpy()
-        value_np  = value.item()
+        # Convert categorical value logits → scalar in [-1, 1]
+        # E[value] = P(win) - P(loss)
+        value_probs = torch.softmax(value_logits.squeeze(0), dim=0)
+        value_np = (value_probs[2] - value_probs[0]).item()  # win_prob - loss_prob
 
         policy = policy_to_move_probs(policy_np, env.board)
 
@@ -157,14 +161,20 @@ class NeuralNetwork:
         return t.to(self.device)
 
     def encode_batch(self, boards: list) -> torch.Tensor:
-        planes = np.stack([encode_board(b) for b in boards]).astype(np.float32)
-        return torch.from_numpy(planes).to(self.device)   # straight to GPU
+        planes = np.stack([encode_board(b) for b in boards])
+        t = torch.from_numpy(planes)
+        if self.device.type == "cuda":
+            return t.pin_memory().to(self.device, non_blocking=True)
+        return t.to(self.device)
 
     def evaluate_batch_infer(self, batch: torch.Tensor):
         """GPU inference for both self-play and training."""
         with torch.no_grad():
-            policy_logits, values = self.model(batch)
-        return policy_logits.cpu().numpy(), values.squeeze(1).cpu().numpy()
+            policy_logits, value_logits = self.model(batch)
+        # Convert categorical value logits → scalar per position
+        value_probs = torch.softmax(value_logits, dim=1)  # (B, 3)
+        values = (value_probs[:, 2] - value_probs[:, 0])  # win_prob - loss_prob
+        return policy_logits.cpu().numpy(), values.cpu().numpy()
 
     def save(self, path: str):
         torch.save(self.model.state_dict(), path)

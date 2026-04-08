@@ -19,13 +19,12 @@ CHECKPOINT_DIR    = "checkpoints"
 LOG_DIR           = "logs"
 RUN_NAME          = "alphazero_v1"
 
-NUM_ITERATIONS    = 100
-GAMES_PER_ITER    = 10
-SIMULATIONS       = 800
-BUFFER_CAPACITY   = 500_000
+NUM_ITERATIONS    = 200
+GAMES_PER_ITER    = 50
+BUFFER_CAPACITY   = 100_000
 MIN_BUFFER_SIZE   = 10_000
 BATCH_SIZE        = 512
-EPOCHS_PER_ITER   = 5
+EPOCHS_PER_ITER   = 10
 
 USE_TENSORBOARD   = True
 USE_WANDB         = False
@@ -70,6 +69,17 @@ def _save_checkpoint(net: NeuralNetwork, iteration: int, label: str = "interrupt
 # Main
 # ------------------------------------------------------------------
 
+def adaptive_simulations(iteration: int) -> int:
+    """Scale MCTS simulations with training progress.
+    Early iterations use fewer sims for faster data generation;
+    later iterations use more for higher quality play.
+    """
+    if iteration <= 20:  return 200
+    if iteration <= 50:  return 400
+    if iteration <= 100: return 800
+    return 1200
+
+
 def main():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -85,6 +95,8 @@ def main():
     )
 
     best_model      = ChessNet()
+    if DEVICE == "cuda" and hasattr(torch, "compile") and sys.platform != "win32":
+        best_model = torch.compile(best_model)
     best_net        = NeuralNetwork(model=best_model, device=DEVICE)
     candidate_model = copy.deepcopy(best_model)
     candidate_net   = NeuralNetwork(model=candidate_model, device=DEVICE)
@@ -107,8 +119,9 @@ def main():
             print(f"{'='*52}")
 
             # 1. Self-play
-            print(f"\n[1] Self-play ({GAMES_PER_ITER} games)...")
-            self_play = ParallelSelfPlay(neural_net=best_net, num_simulations=SIMULATIONS, num_parallel=40, leaves_per_game=10)
+            print(f"\n[1] Self-play ({GAMES_PER_ITER} games, {adaptive_simulations(iteration)} sims)...")
+            sims = adaptive_simulations(iteration)
+            self_play = ParallelSelfPlay(neural_net=best_net, num_simulations=sims, num_parallel=40, leaves_per_game=10)
             positions = self_play.generate(num_games=GAMES_PER_ITER)
 
             buffer.push_game(positions)
@@ -127,7 +140,7 @@ def main():
             # 2. Train
             print(f"\n[2] Training...")
             candidate_model.load_state_dict(copy.deepcopy(best_model.state_dict()))
-            losses = trainer.train_step(buffer)
+            losses = trainer.train_step(buffer, iteration=iteration, num_iterations=NUM_ITERATIONS)
             logger.log_training(step=iteration, losses=losses)
             print(
                 f"    policy={losses['policy_loss']:.4f}  "

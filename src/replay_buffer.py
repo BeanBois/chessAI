@@ -8,19 +8,19 @@ class ReplayBuffer:
     Memory-efficient replay buffer.
 
     Savings vs naive float32 storage:
-      State:  float32 (4,608 B) → uint8 (1,152 B)   — 4× smaller
+      State:  float32 (92,160 B for 144×8×8) → uint8 (23,040 B)  — 4× smaller
       Policy: float32 (18,688 B) → sparse dict (~240 B) — ~78× smaller
-    
-    Total per position: ~1,400 B instead of ~23,300 B
-    500k capacity: ~700 MB instead of ~11.6 GB
+
+    Total per position: ~23,280 B instead of ~110,848 B
+    500k capacity: ~11.6 GB instead of ~55 GB (still large — reduce capacity if needed)
     """
 
-    def __init__(self, capacity: int = 100_000):  # start small, grow if needed
+    def __init__(self, capacity: int = 100_000):
         self.buffer = deque(maxlen=capacity)
 
     def push(self, state: np.ndarray, policy: dict, value: float):
         """
-        state  : (18, 8, 8) float32 — will be compressed to uint8
+        state  : (144, 8, 8) float32 — will be compressed to uint8
         policy : dict[int, float]   — sparse {action_index: probability}
         value  : float
         """
@@ -37,7 +37,7 @@ class ReplayBuffer:
         states, policies, values = zip(*batch)
 
         # Decompress states back to float32 for the network
-        state_arr = np.stack(states).astype(np.float32)          # (B, 18, 8, 8)
+        state_arr = np.stack(states).astype(np.float32)          # (B, 144, 8, 8)
 
         # Reconstruct dense policy vectors from sparse dicts
         policy_arr = np.zeros((len(batch), 4672), dtype=np.float32)

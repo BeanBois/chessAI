@@ -104,19 +104,10 @@ def _assign_outcomes(
     history: list[tuple],
     env: ChessGame,
 ) -> list[tuple]:
-    outcome = env.board.outcome()
-    winner  = outcome.winner if outcome else None
-
-    trajectory = []
-    for state, policy_vec, player in history:
-        if winner is None:
-            value = 0.0
-        elif winner == player:
-            value = 1.0
-        else:
-            value = -1.0
-        trajectory.append((state, policy_vec, value))
-    return trajectory
+    # Use env.get_result() so fivefold-repetition and 75-move-rule games
+    # are correctly identified as draws (0.0) rather than falling through
+    # as None when env.board.outcome() returns None for those terminal types.
+    return [(s, p, env.get_result(pl)) for s, p, pl in history]
 
 
 # ------------------------------------------------------------------

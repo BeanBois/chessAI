@@ -4,6 +4,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from .cnn_model.network import ChessNet
+from .cnn_model.board_encoder import decode_board
+from .cnn_model.move_encoder import legal_move_mask
 from .replay_buffer import ReplayBuffer
 
 
@@ -45,7 +47,7 @@ class Trainer:
             self.optimizer, T_max=1000, eta_min=1e-5
         )
 
-    def train_step(self, buffer: ReplayBuffer) -> dict[str, float]:
+    def train_step(self, buffer: ReplayBuffer, iteration: int = 0, num_iterations: int = 200) -> dict[str, float]:
         """
         Sample a batch from the buffer and do one round of gradient updates.
         Returns a dict of losses for logging.
@@ -56,14 +58,30 @@ class Trainer:
             "Check MIN_BUFFER_SIZE guard in train.py."
         )
 
+        # Decay weight decay from 1e-4 → 1e-5 over training
+        progress = min(iteration / max(num_iterations, 1), 1.0)
+        current_wd = 1e-4 * (1.0 - 0.9 * progress) + 1e-5 * 0.9 * progress
+        for param_group in self.optimizer.param_groups:
+            param_group['weight_decay'] = current_wd
+
         states, policies, values = buffer.sample(
             min(len(buffer), self.batch_size * self.epochs_per_update)
         )
+
+        # Precompute legal move masks for all sampled positions.
+        # Illegal indices get -inf so log_softmax zeroes them out; legal indices get 0.0.
+        N = states.shape[0]
+        mask_np = np.full((N, 4672), float('-inf'), dtype=np.float32)
+        for i in range(N):
+            board = decode_board(states[i])
+            mask_np[i, legal_move_mask(board)] = 0.0
+        masks = torch.from_numpy(mask_np)
 
         dataset = TensorDataset(
             torch.from_numpy(states),
             torch.from_numpy(policies),
             torch.from_numpy(values),
+            masks,
         )
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
@@ -72,21 +90,27 @@ class Trainer:
         total_value_loss  = 0.0
         num_batches       = 0
 
-        for s_batch, pi_batch, z_batch in loader:
-            s_batch  = s_batch.to(self.device)
-            pi_batch = pi_batch.to(self.device)
-            z_batch  = z_batch.to(self.device)
+        for s_batch, pi_batch, z_batch, mask_batch in loader:
+            s_batch    = s_batch.to(self.device)
+            pi_batch   = pi_batch.to(self.device)
+            z_batch    = z_batch.to(self.device)
+            mask_batch = mask_batch.to(self.device)
 
             policy_logits, value_pred = self.model(s_batch)
 
-            # Policy loss: cross-entropy between MCTS distribution and network output
-            # log_softmax + (target * log_prob) — more numerically stable than softmax first
-            log_probs   = torch.log_softmax(policy_logits, dim=1)
-            policy_loss = -(pi_batch * log_probs).sum(dim=1).mean()
+            # Policy loss: cross-entropy between MCTS distribution and network output.
+            # Mask illegal moves to -inf before log_softmax so the network only
+            # competes over legal moves (same as inference in policy_to_move_probs).
+            # nan_to_num guards against 0 * -inf = nan at zero-probability positions.
+            masked_logits = policy_logits + mask_batch
+            log_probs     = torch.log_softmax(masked_logits, dim=1)
+            policy_loss   = -(torch.nan_to_num(pi_batch * log_probs, nan=0.0)).sum(dim=1).mean()
 
-            # Value loss: MSE between network estimate and actual outcome
-            value_loss = nn.functional.mse_loss(
-                value_pred.squeeze(1), z_batch
+            # Value loss: cross-entropy over {loss, draw, win} classes
+            # Target: z=-1.0 → class 0 (loss), z=0.0 → class 1 (draw), z=1.0 → class 2 (win)
+            value_class = ((z_batch + 1.0) * 1.0).long().clamp(0, 2)  # -1→0, 0→1, 1→2
+            value_loss = nn.functional.cross_entropy(
+                value_pred, value_class
             )
 
             loss = policy_loss + value_loss

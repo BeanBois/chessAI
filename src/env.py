@@ -41,34 +41,29 @@ class ChessGame:
 
     def is_terminal(self) -> bool:
         """
-        Covers all FIDE draw conditions that python-chess tracks:
-        - Checkmate
-        - Stalemate
-        - Threefold repetition (can_claim, not just is_fivefold)
-        - Fifty-move rule (can_claim)
-        - Insufficient material
+        Terminal conditions — uses standard claimable rules for faster games
+        and richer value signal:
+        - Checkmate / stalemate / insufficient material  (via is_game_over())
+        - Threefold repetition   (claimable at 3 repeats)
+        - 50-move rule           (claimable at 50 moves)
+        - Hard cap at 256 half-moves to prevent infinite games
         """
         return (
             self.board.is_game_over()
-            or self.board.can_claim_threefold_repetition()
-            or self.board.can_claim_fifty_moves()
+            or self.board.is_repetition(3)
+            or self.board.is_fifty_moves()
+            or self.t >= 256
         )
 
     def get_result(self, player: chess.Color) -> float:
         assert self.is_terminal(), "get_result() called on non-terminal state"
 
-        # Claim draws before checking outcome — outcome() returns None mid-game
-        if (
-            self.board.can_claim_threefold_repetition()
-            or self.board.can_claim_fifty_moves()
-            or self.board.is_insufficient_material()
-        ):
-            return 0.0
-
         outcome = self.board.outcome()
-        if outcome is None or outcome.winner is None:
-            return 0.0
-        return 1.0 if outcome.winner == player else -1.0
+        if outcome is not None and outcome.winner is not None:
+            return 1.0 if outcome.winner == player else -1.0
+
+        # Draw: repetition, 50-move, insufficient material, stalemate, or move cap
+        return 0.0
 
     @property
     def current_player(self) -> chess.Color:

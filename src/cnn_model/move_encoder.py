@@ -143,27 +143,32 @@ def policy_to_move_probs(
     """
     Convert raw policy logits → probability dict over legal moves.
     Handles illegal move masking and perspective flip for Black.
+
+    Single-pass: collects legal move indices, slices logits directly,
+    runs softmax only over those indices — no 4672-element mask alloc.
     """
     flip = board.turn == chess.BLACK
-    mask = legal_move_mask(board)
-
-    # Mask illegal moves, softmax over legal ones
-    logits = policy_logits.copy()
-    logits[~mask] = -1e9
-    logits -= logits.max()       # numerical stability
-    exp = np.exp(logits)
-    probs = exp / exp.sum()
-
-    # Map back to chess.Move
     move_map = _build_move_to_index()
-    idx_to_move_raw = {v: k for k, v in move_map.items()}
-    result = {}
-    for move in board.legal_moves:
+
+    legal_moves = list(board.legal_moves)
+    indices = []
+    mapped_moves = []
+    for move in legal_moves:
         m = _mirror_move(move) if flip else move
         if m in move_map:
-            result[move] = float(probs[move_map[m]])
+            indices.append(move_map[m])
+            mapped_moves.append(move)
 
-    return result
+    if not indices:
+        return {}
+
+    # Softmax only over the legal logits
+    legal_logits = policy_logits[indices]
+    legal_logits = legal_logits - legal_logits.max()   # numerical stability
+    exp = np.exp(legal_logits)
+    probs = exp / exp.sum()
+
+    return dict(zip(mapped_moves, probs.tolist()))
 
 
 def _mirror_move(move: chess.Move) -> chess.Move:

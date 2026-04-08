@@ -299,10 +299,7 @@ class MCTS:
             return
         boards = [n.env.board for n in to_evaluate]
         batch  = self.neural_net.encode_batch(boards)
-        with torch.no_grad():
-            policy_logits, values = self.neural_net.model(batch)
-        policy_logits_np = policy_logits.cpu().numpy()
-        values_np        = values.squeeze(1).cpu().numpy()
+        policy_logits_np, values_np = self.neural_net.evaluate_batch_infer(batch)
         for i, node in enumerate(to_evaluate):
             node._nn_value = float(values_np[i])
             policy_dict    = policy_to_move_probs(policy_logits_np[i], node.env.board)

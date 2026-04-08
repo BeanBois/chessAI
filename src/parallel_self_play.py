@@ -46,8 +46,8 @@ from .cnn_model.board_encoder import encode_board
 from .cnn_model.move_encoder import move_to_index
 from .mcts import MCTS
 
-TEMP_THRESHOLD = 30
-MAX_GAME_MOVES = 512
+TEMP_THRESHOLD = 15
+MAX_GAME_MOVES = 256
 
 
 # ------------------------------------------------------------------
@@ -70,10 +70,11 @@ def _assign_outcomes(
     history: list[tuple],
     env: ChessGame,
 ) -> list[tuple]:
-    outcome = env.board.outcome()
-    winner  = outcome.winner if outcome else None
+    # Use env.get_result() so fivefold-repetition and 75-move-rule games
+    # are correctly identified as draws (0.0) rather than falling through
+    # as None when env.board.outcome() returns None for those terminal types.
     return [
-        (s, p, 0.0 if winner is None else (1.0 if winner == pl else -1.0))
+        (s, p, env.get_result(pl))
         for s, p, pl in history
     ]
 
@@ -242,15 +243,17 @@ class ParallelSelfPlay:
                     with torch.cuda.stream(self._stream):
                         with torch.no_grad():
                             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                policy_logits, values = self.neural_net.model(batch)
+                                policy_logits, value_logits = self.neural_net.model(batch)
                     # CPU can do other work here until we actually need the results
                     self._stream.synchronize()
                 else:
                     with torch.no_grad():
-                        policy_logits, values = self.neural_net.model(batch)
+                        policy_logits, value_logits = self.neural_net.model(batch)
 
                 pol_np = policy_logits.float().cpu().numpy()
-                val_np = values.float().squeeze(1).cpu().numpy()
+                # Convert categorical value logits → scalar: E[value] = P(win) - P(loss)
+                value_probs = torch.softmax(value_logits.float(), dim=1)
+                val_np = (value_probs[:, 2] - value_probs[:, 0]).cpu().numpy()
             
             # ── 3. Feed results back to each slot ────────────────────────────
             for slot, start, end in slot_slices:
