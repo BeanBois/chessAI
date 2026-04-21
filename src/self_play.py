@@ -25,10 +25,10 @@ def _play_game_worker(packed: tuple) -> list[tuple]:
     state_dict, num_simulations = packed
 
     # Import inside the worker to avoid pickling torch objects
-    from src.cnn_model.network import ChessNet, NeuralNetwork
+    from src.cnn_model.network import ChessTransformer, NeuralNetwork
     from src.self_play import _play_one_game
 
-    model = ChessNet()
+    model = ChessTransformer()
     model.load_state_dict(state_dict)
     net = NeuralNetwork(model=model, device="cpu")   # workers always use CPU
     return _play_one_game(net, num_simulations)

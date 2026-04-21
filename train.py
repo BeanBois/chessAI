@@ -3,7 +3,7 @@ import copy
 import signal
 import sys
 import torch
-from src.cnn_model.network import ChessNet, NeuralNetwork
+from src.cnn_model.network import ChessTransformer, NeuralNetwork
 from src.replay_buffer import ReplayBuffer
 from src.parallel_self_play import ParallelSelfPlay
 from src.trainer import Trainer
@@ -17,14 +17,14 @@ from src.logger import MetricsLogger
 DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_DIR    = "checkpoints"
 LOG_DIR           = "logs"
-RUN_NAME          = "alphazero_v1"
+RUN_NAME          = "transformer_v1"
 
 NUM_ITERATIONS    = 200
 GAMES_PER_ITER    = 50
-BUFFER_CAPACITY   = 100_000
+BUFFER_CAPACITY   = 50_000
 MIN_BUFFER_SIZE   = 10_000
 BATCH_SIZE        = 512
-EPOCHS_PER_ITER   = 10
+EPOCHS_PER_ITER   = 5
 
 USE_TENSORBOARD   = True
 USE_WANDB         = False
@@ -94,7 +94,7 @@ def main():
         use_wandb       = USE_WANDB,
     )
 
-    best_model      = ChessNet()
+    best_model      = ChessTransformer()
     if DEVICE == "cuda" and hasattr(torch, "compile") and sys.platform != "win32":
         best_model = torch.compile(best_model)
     best_net        = NeuralNetwork(model=best_model, device=DEVICE)

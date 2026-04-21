@@ -66,17 +66,42 @@ def _build_policy_vector(
     }
 
 
+GAMMA = 1.0  # undiscounted — every position's target is the game outcome
+
+# Resignation: prevents losing side dragging games into 50-move/repetition draws
+RESIGN_THRESHOLD   = -0.9   # resign when root Q-value is below this
+RESIGN_CONSECUTIVE = 5      # for this many consecutive moves
+NO_RESIGN_FRAC     = 0.1    # fraction of games where resignation is disabled
+
+
 def _assign_outcomes(
     history: list[tuple],
     env: ChessGame,
 ) -> list[tuple]:
-    # Use env.get_result() so fivefold-repetition and 75-move-rule games
-    # are correctly identified as draws (0.0) rather than falling through
-    # as None when env.board.outcome() returns None for those terminal types.
-    return [
-        (s, p, env.get_result(pl))
-        for s, p, pl in history
-    ]
+    """
+    Compute discounted return G(t) for each position in the game trajectory.
+
+    Each position's value target blends:
+      - Per-step capture reward (scaled so total << terminal ±1.0)
+      - Terminal outcome ±1.0/0.0 at the final position
+    using negamax discounting: returns are computed backward and the sign
+    flips at each step because the players alternate.
+
+    G(t) = r(t) + γ * -G(t+1)   (negamax: opponent's gain is our loss)
+    """
+    T = len(history)
+    values = [0.0] * T
+    g = 0.0
+    for t in reversed(range(T)):
+        state, policy, player, capture_r = history[t]
+        r = capture_r
+        if t == T - 1:
+            r += env.get_result(player)  # terminal win/loss/draw
+        # g is the discounted return from the NEXT half-move's perspective;
+        # negate because the next half-move belongs to the opponent.
+        g = r + GAMMA * (-g)
+        values[t] = max(-1.0, min(1.0, g))
+    return [(s, p, v) for (s, p, _, _), v in zip(history, values)]
 
 
 # ------------------------------------------------------------------
@@ -93,9 +118,10 @@ class _Slot:
     __slots__ = (
         "num_simulations", "env", "mcts",
         "history", "move_count", "done", "trajectory",
+        "resign_counter", "allow_resign",
     )
 
-    def __init__(self, num_simulations: int):
+    def __init__(self, num_simulations: int, allow_resign: bool = True):
         self.num_simulations = num_simulations
         self.env:        ChessGame = None
         self.mcts:       MCTS      = None
@@ -103,6 +129,8 @@ class _Slot:
         self.move_count: int       = 0
         self.done:       bool      = False
         self.trajectory: list      = []
+        self.resign_counter: int   = 0
+        self.allow_resign: bool    = allow_resign
 
     def reset(self) -> None:
         """Start a brand new game."""
@@ -115,6 +143,7 @@ class _Slot:
         self.move_count = 0
         self.done       = False
         self.trajectory = []
+        self.resign_counter = 0
 
     def commit_move(self) -> None:
         """
@@ -131,25 +160,57 @@ class _Slot:
         weights = np.array(list(probs.values()), dtype=np.float32)
         weights /= weights.sum()   # floating-point safety
 
-        # Record position BEFORE the move
-        state  = encode_board(self.env.board)
-        policy = _build_policy_vector(probs, self.env.board)
-        player = self.env.current_player
-        self.history.append((state, policy, player))
-
-        # Sample move, save child subtree, step env
+        # Sample move first so we can compute the capture reward on the pre-move board
         move = np.random.choice(moves, p=weights)
+
+        # Record position BEFORE the move (capture reward requires pre-move board)
+        state        = encode_board(self.env.board)
+        policy       = _build_policy_vector(probs, self.env.board)
+        player       = self.env.current_player
+        capture_r    = self.env._capture_reward_normalized(move)
+        self.history.append((state, policy, player, capture_r))
         self.mcts.advance_root(move)    # must come BEFORE env.step
         self.env.step(move)
         self.move_count += 1
 
         if self.env.is_terminal() or self.move_count >= MAX_GAME_MOVES:
             self.done = True
-            if self.move_count >= MAX_GAME_MOVES:
-                self.trajectory = [(s, p, 0.0) for s, p, _ in self.history]
-            else:
-                self.trajectory = _assign_outcomes(self.history, self.env)
+            self.trajectory = _assign_outcomes(self.history, self.env)
         else:
+            # Check resignation: if root Q-value is very negative for several
+            # consecutive moves, the current player resigns. This prevents
+            # losing games from dragging into draws via repetition / 50-move rule.
+            if self.allow_resign:
+                root_q = root.q_value
+                if root_q < RESIGN_THRESHOLD:
+                    self.resign_counter += 1
+                else:
+                    self.resign_counter = 0
+
+                if self.resign_counter >= RESIGN_CONSECUTIVE:
+                    self.done = True
+                    # Assign loss for the current player (who just moved)
+                    # by using the environment's terminal result logic.
+                    # Since the game isn't actually terminal, manually set values:
+                    # the last player to move resigned, so they lose.
+                    T = len(self.history)
+                    values = [0.0] * T
+                    g = 0.0
+                    for t in reversed(range(T)):
+                        state, policy, plr, capture_r = self.history[t]
+                        r = capture_r
+                        if t == T - 1:
+                            # The player who just moved (current_player has flipped)
+                            # is the one resigning, so from their POV it's -1.0
+                            r += -1.0
+                        g = r + GAMMA * (-g)
+                        values[t] = max(-1.0, min(1.0, g))
+                    self.trajectory = [
+                        (s, p, v)
+                        for (s, p, _, _), v in zip(self.history, values)
+                    ]
+                    return
+
             # Prepare root for the next position (tree reuse handled inside)
             self.mcts.prepare_search(self.env)
 
@@ -201,9 +262,12 @@ class ParallelSelfPlay:
 
         # Initialise slots — never more slots than games requested
         n_slots = min(self.num_parallel, num_games)
-        slots   = [_Slot(self.num_simulations) for _ in range(n_slots)]
-        for slot in slots:
+        slots   = []
+        for i in range(n_slots):
+            allow_resign = (i / n_slots) >= NO_RESIGN_FRAC  # first ~10% are no-resign
+            slot = _Slot(self.num_simulations, allow_resign=allow_resign)
             slot.reset()
+            slots.append(slot)
         print('Generating games ... ')
 
         while completed < num_games:
@@ -251,9 +315,8 @@ class ParallelSelfPlay:
                         policy_logits, value_logits = self.neural_net.model(batch)
 
                 pol_np = policy_logits.float().cpu().numpy()
-                # Convert categorical value logits → scalar: E[value] = P(win) - P(loss)
-                value_probs = torch.softmax(value_logits.float(), dim=1)
-                val_np = (value_probs[:, 2] - value_probs[:, 0]).cpu().numpy()
+                # Scalar value output (tanh already applied by model)
+                val_np = value_logits.float().squeeze(-1).cpu().numpy()
             
             # ── 3. Feed results back to each slot ────────────────────────────
             for slot, start, end in slot_slices:

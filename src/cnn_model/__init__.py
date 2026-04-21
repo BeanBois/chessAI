@@ -1,1 +1,1 @@
-from .network import ChessNet
+from .network import ChessNet, ChessTransformer

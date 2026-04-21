@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 import chess
 
 from .board_encoder import encode_board, TOTAL_PLANES
@@ -9,7 +10,7 @@ from .move_encoder import policy_to_move_probs, TOTAL_ACTIONS
 
 
 # ------------------------------------------------------------------
-# Building blocks
+# Building blocks (CNN — kept for backward compatibility)
 # ------------------------------------------------------------------
 
 class ConvBnRelu(nn.Module):
@@ -40,41 +41,32 @@ class ResBlock(nn.Module):
         return F.relu(out + residual, inplace=True)
 
 
-# ------------------------------------------------------------------
-# Full network
-# ------------------------------------------------------------------
-
 class ChessNet(nn.Module):
     """
-    AlphaZero-style network.
+    AlphaZero-style CNN (kept for loading old checkpoints).
 
-    Input:  (B, 18, 8, 8)  — encoded board planes
-    Output: policy logits (B, 4672)  +  value scalar (B, 1)
+    Input:  (B, 144, 8, 8)
+    Output: policy logits (B, 4672)  +  value logits (B, 3)
     """
 
     def __init__(
         self,
-        in_planes:    int = TOTAL_PLANES,  # 144 (8 history × 18 planes)
-        num_channels: int = 256,   # residual tower width
-        num_blocks:   int = 20,    # residual tower depth
-        policy_size:  int = TOTAL_ACTIONS,  # 4672
+        in_planes:    int = TOTAL_PLANES,
+        num_channels: int = 256,
+        num_blocks:   int = 20,
+        policy_size:  int = TOTAL_ACTIONS,
     ):
         super().__init__()
 
-        # Stem
         self.stem = ConvBnRelu(in_planes, num_channels, kernel=3, padding=1)
-
-        # Residual tower
         self.tower = nn.Sequential(*[ResBlock(num_channels) for _ in range(num_blocks)])
 
-        # Policy head: 1×1 conv (reduce channels) → flatten → FC
         self.policy_conv = ConvBnRelu(num_channels, 2, kernel=1, padding=0)
         self.policy_fc   = nn.Linear(2 * 8 * 8, policy_size)
 
-        # Value head: 1×1 conv → flatten → FC → 3-class categorical (loss/draw/win)
         self.value_conv = ConvBnRelu(num_channels, 1, kernel=1, padding=0)
         self.value_fc1  = nn.Linear(1 * 8 * 8, 256)
-        self.value_fc2  = nn.Linear(256, 3)  # logits for [loss, draw, win]
+        self.value_fc2  = nn.Linear(256, 3)
 
         self._init_weights()
 
@@ -90,22 +82,126 @@ class ChessNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor):
-        # x: (B, 144, 8, 8)
-        out = self.stem(x)    # (B, 256, 8, 8)
-        out = self.tower(out) # (B, 256, 8, 8)
+        out = self.stem(x)
+        out = self.tower(out)
 
-        # Policy head
-        p = self.policy_conv(out)                   # (B, 2, 8, 8)
-        p = p.view(p.size(0), -1)                   # (B, 128)
-        policy_logits = self.policy_fc(p)            # (B, 4672)
+        p = self.policy_conv(out)
+        p = p.view(p.size(0), -1)
+        policy_logits = self.policy_fc(p)
 
-        # Value head: categorical over {loss, draw, win}
-        # Returns (B, 3) logits. Caller converts to scalar via softmax.
-        v = self.value_conv(out)                    # (B, 1, 8, 8)
+        v = self.value_conv(out)
         v = F.relu(self.value_fc1(v.view(v.size(0), -1)), inplace=True)
-        value_logits = self.value_fc2(v)            # (B, 3) ∈ [-∞, +∞]
+        value_logits = self.value_fc2(v)
 
         return policy_logits, value_logits
+
+
+# ------------------------------------------------------------------
+# Transformer architecture
+# ------------------------------------------------------------------
+
+class ChessTransformer(nn.Module):
+    """
+    Vision Transformer for chess position evaluation.
+
+    Treats the 8x8 board as 64 tokens, each with a feature vector derived
+    from the input planes at that square. Self-attention allows pieces to
+    "see" each other regardless of distance — better than CNN for long-range
+    interactions (rooks, bishops, queens).
+
+    Input:  (B, 144, 8, 8)
+    Output: policy logits (B, 4672)  +  value scalar (B, 1)
+    """
+
+    def __init__(
+        self,
+        in_planes:       int = TOTAL_PLANES,   # 144
+        d_model:         int = 256,
+        nhead:           int = 8,
+        num_layers:      int = 8,
+        dim_feedforward: int = 1024,
+        dropout:         float = 0.1,
+        policy_planes:   int = 73,             # move planes per source square
+    ):
+        super().__init__()
+        self.d_model       = d_model
+        self.policy_planes = policy_planes
+        self.num_squares   = 64
+
+        # Per-square input projection: 144 features → d_model
+        self.input_proj = nn.Linear(in_planes, d_model)
+
+        # Learned positional embedding for each of the 64 squares
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_squares, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Pre-norm transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,  # pre-norm (more stable training)
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),  # final norm after last layer
+        )
+
+        # Policy head: per-token prediction of 73 move planes
+        # Output shape: (B, 64, 73) → reshape to (B, 4672)
+        self.policy_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, policy_planes),
+        )
+
+        # Value head: mean-pool → MLP → scalar tanh
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Tanh(),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor):
+        # x: (B, 144, 8, 8)
+        B = x.size(0)
+
+        # Reshape: (B, 144, 8, 8) → (B, 64, 144)
+        # Each of the 64 squares gets its 144-channel feature vector
+        tokens = x.view(B, x.size(1), 64).permute(0, 2, 1)  # (B, 64, 144)
+
+        # Project to d_model and add positional embedding
+        tokens = self.input_proj(tokens) + self.pos_embed  # (B, 64, 256)
+
+        # Transformer encoder
+        tokens = self.encoder(tokens)  # (B, 64, 256)
+
+        # Policy head: per-square move prediction
+        policy = self.policy_head(tokens)                # (B, 64, 73)
+        policy_logits = policy.reshape(B, -1)            # (B, 4672)
+
+        # Value head: global mean pool → scalar
+        global_repr = tokens.mean(dim=1)                 # (B, 256)
+        value = self.value_head(global_repr)             # (B, 1)
+
+        return policy_logits, value
 
 
 # ------------------------------------------------------------------
@@ -114,14 +210,16 @@ class ChessNet(nn.Module):
 
 class NeuralNetwork:
     """
-    Wraps ChessNet with numpy I/O so MCTS doesn't touch PyTorch.
-    This is the object you pass into MCTS(neural_net=...).
+    Wraps a chess model (ChessTransformer or ChessNet) with numpy I/O
+    so MCTS doesn't touch PyTorch.
     """
 
-    def __init__(self, model: ChessNet = None, device: str = "cpu"):
+    def __init__(self, model: nn.Module = None, device: str = "cpu"):
         self.device = torch.device(device)
-        self.model  = (model if model is not None else ChessNet()).to(self.device)
+        self.model  = (model if model is not None else ChessTransformer()).to(self.device)
         self.model.eval()
+        # Detect whether model outputs scalar value or categorical logits
+        self._scalar_value = isinstance(self.model, ChessTransformer)
 
     def evaluate(
         self,
@@ -131,18 +229,21 @@ class NeuralNetwork:
         """
         Returns:
           policy — dict mapping each legal move to a prior probability
-          value  — float ∈ [-1, 1], position eval from current player's POV
+          value  — float in [-1, 1], position eval from current player's POV
         """
         board_tensor = self._encode(env.board)
 
         with torch.no_grad():
-            policy_logits, value_logits = self.model(board_tensor)
+            policy_logits, value_out = self.model(board_tensor)
 
         policy_np = policy_logits.squeeze(0).cpu().numpy()
-        # Convert categorical value logits → scalar in [-1, 1]
-        # E[value] = P(win) - P(loss)
-        value_probs = torch.softmax(value_logits.squeeze(0), dim=0)
-        value_np = (value_probs[2] - value_probs[0]).item()  # win_prob - loss_prob
+
+        if self._scalar_value:
+            value_np = value_out.squeeze().item()
+        else:
+            # Legacy ChessNet: categorical → scalar
+            value_probs = torch.softmax(value_out.squeeze(0), dim=0)
+            value_np = (value_probs[2] - value_probs[0]).item()
 
         policy = policy_to_move_probs(policy_np, env.board)
 
@@ -156,8 +257,8 @@ class NeuralNetwork:
         return policy, value_np
 
     def _encode(self, board: chess.Board) -> torch.Tensor:
-        planes = encode_board(board)                        # (18, 8, 8)
-        t = torch.from_numpy(planes).unsqueeze(0)          # (1, 18, 8, 8)
+        planes = encode_board(board)                        # (144, 8, 8)
+        t = torch.from_numpy(planes).unsqueeze(0)          # (1, 144, 8, 8)
         return t.to(self.device)
 
     def encode_batch(self, boards: list) -> torch.Tensor:
@@ -170,10 +271,15 @@ class NeuralNetwork:
     def evaluate_batch_infer(self, batch: torch.Tensor):
         """GPU inference for both self-play and training."""
         with torch.no_grad():
-            policy_logits, value_logits = self.model(batch)
-        # Convert categorical value logits → scalar per position
-        value_probs = torch.softmax(value_logits, dim=1)  # (B, 3)
-        values = (value_probs[:, 2] - value_probs[:, 0])  # win_prob - loss_prob
+            policy_logits, value_out = self.model(batch)
+
+        if self._scalar_value:
+            values = value_out.squeeze(-1)  # (B,)
+        else:
+            # Legacy ChessNet: categorical → scalar
+            value_probs = torch.softmax(value_out, dim=1)
+            values = value_probs[:, 2] - value_probs[:, 0]
+
         return policy_logits.cpu().numpy(), values.cpu().numpy()
 
     def save(self, path: str):

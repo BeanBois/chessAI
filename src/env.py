@@ -13,6 +13,12 @@ MAX_CAPTURE_VALUE = 9.0
 CAPTURE_WEIGHT = 0.5
 MOBILITY_WEIGHT = 0.05
 
+# Shaped reward scaling for discounted return computation in self-play.
+# MATERIAL_SCALE: total one-side material (8P+2N+2B+2R+1Q = 8+6+6+10+9 = 39)
+# CAPTURE_SCALE:  weight so that capturing everything ≈ 0.3 << terminal ±1.0
+MATERIAL_SCALE = 39.0
+CAPTURE_SCALE  = 0.3
+
 
 class ChessGame:
     def __init__(self, board: chess.Board = None):
@@ -108,8 +114,22 @@ class ChessGame:
         }
 
     # ------------------------------------------------------------------
-    # Reward components (for neural network training loss)
+    # Reward components
     # ------------------------------------------------------------------
+
+    def _capture_reward_normalized(self, action: chess.Move) -> float:
+        """Normalized capture reward for discounted-return value targets.
+        Returns the material value of the captured piece scaled to keep the
+        cumulative reward well below the terminal ±1.0 outcome signal.
+        """
+        if not self.board.is_capture(action):
+            return 0.0
+        if self.board.is_en_passant(action):
+            return CAPTURE_SCALE * (PIECE_VALUES[chess.PAWN] / MATERIAL_SCALE)
+        captured = self.board.piece_at(action.to_square)
+        if captured is None:
+            return 0.0
+        return CAPTURE_SCALE * (PIECE_VALUES.get(captured.piece_type, 0) / MATERIAL_SCALE)
 
     def _capture_reward(self, action: chess.Move) -> float:
         if not self.board.is_capture(action):
