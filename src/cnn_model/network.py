@@ -219,7 +219,9 @@ class NeuralNetwork:
         self.model  = (model if model is not None else ChessTransformer()).to(self.device)
         self.model.eval()
         # Detect whether model outputs scalar value or categorical logits
-        self._scalar_value = isinstance(self.model, ChessTransformer)
+        # Use getattr to handle torch.compile() wrapping (OptimizedModule)
+        raw = getattr(self.model, "_orig_mod", self.model)
+        self._scalar_value = isinstance(raw, ChessTransformer)
 
     def evaluate(
         self,
